@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 from typing import List
 
-from PySide6.QtCore import Qt, QSettings, QThread, QPointF, QRectF
+from PySide6.QtCore import Qt, QSettings, QThread, QPointF, QRectF, Signal
 from PySide6.QtGui import QPixmap, QImage, QIcon, QPainter, QColor, QPen, QPainterPath
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
@@ -35,38 +35,59 @@ def pil_to_qpixmap(pil_img) -> QPixmap:
     return QPixmap.fromImage(qimg)
 
 class PreviewWidget(QWidget):
-    def __init__(self, width: int, height: int):
+    lens_requested = Signal(int)
+
+    def __init__(self, width: int, height: int, index: int, lens_zoom: float = 2.0):
         super().__init__()
         self.setFixedSize(width, height)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self._pixmap: QPixmap | None = None
+        self._lens_pixmap: QPixmap | None = None
         self._message = "隱ｭ縺ｿ霎ｼ縺ｿ荳ｭ窶ｦ"
         self._message_color = QColor("#777")
         self._bg_color = QColor("#1a1a1a")
         self._lens_enabled = False
         self._lens_center = QPointF(width / 2, height / 2)
         self._lens_radius = 120.0
-        self._lens_zoom = 2.0
+        self._lens_zoom = lens_zoom
         self._dragging = False
+        self._index = index
 
     def set_pixmap(self, pixmap: QPixmap):
         self._pixmap = pixmap
+        self._lens_pixmap = None
         self._message = ""
         self.update()
 
+    def set_lens_pixmap(self, pixmap: QPixmap):
+        self._lens_pixmap = pixmap
+        if self._lens_enabled and self._dragging:
+            self.update()
+
     def set_message(self, msg: str, color: str = "#777"):
         self._pixmap = None
+        self._lens_pixmap = None
         self._message = msg
         self._message_color = QColor(color)
         self._lens_enabled = False
         self._dragging = False
         self.update()
 
+    def has_pixmap(self) -> bool:
+        return self._pixmap is not None
+
+    def has_lens_pixmap(self) -> bool:
+        return self._lens_pixmap is not None
+
+    def lens_zoom(self) -> float:
+        return self._lens_zoom
+
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._pixmap:
             self._lens_enabled = not self._lens_enabled
             if self._lens_enabled:
                 self._lens_center = QPointF(event.position())
+                self.lens_requested.emit(self._index)
             else:
                 self._dragging = False
             self.update()
@@ -76,6 +97,8 @@ class PreviewWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and self._lens_enabled:
             self._dragging = True
             self._lens_center = QPointF(event.position())
+            if not self._lens_pixmap and self._pixmap:
+                self.lens_requested.emit(self._index)
             self.update()
         super().mousePressEvent(event)
 
@@ -106,7 +129,8 @@ class PreviewWidget(QWidget):
             self._paint_lens(painter)
 
     def _paint_lens(self, painter: QPainter):
-        if not self._pixmap:
+        src_pixmap = self._lens_pixmap or self._pixmap
+        if not src_pixmap:
             return
         center = self._lens_center
         radius = self._lens_radius
@@ -117,21 +141,21 @@ class PreviewWidget(QWidget):
         src_radius = radius / self._lens_zoom
         src_rect = QRectF(center.x() - src_radius, center.y() - src_radius, src_radius * 2, src_radius * 2)
 
-        scale_x = self._pixmap.width() / max(1, self.width())
-        scale_y = self._pixmap.height() / max(1, self.height())
+        scale_x = src_pixmap.width() / max(1, self.width())
+        scale_y = src_pixmap.height() / max(1, self.height())
         src_rect = QRectF(
             src_rect.x() * scale_x,
             src_rect.y() * scale_y,
             src_rect.width() * scale_x,
             src_rect.height() * scale_y,
         )
-        src_rect = src_rect.intersected(QRectF(0, 0, self._pixmap.width(), self._pixmap.height()))
+        src_rect = src_rect.intersected(QRectF(0, 0, src_pixmap.width(), src_pixmap.height()))
 
         painter.save()
         clip_path = QPainterPath()
         clip_path.addEllipse(lens_rect)
         painter.setClipPath(clip_path)
-        painter.drawPixmap(lens_rect, self._pixmap, src_rect)
+        painter.drawPixmap(lens_rect, src_pixmap, src_rect)
         painter.restore()
 
         shadow_pen = QPen(QColor(0, 0, 0, 140), 4)
@@ -566,8 +590,14 @@ class MainWindow(QMainWindow):
         self._preview_item_width = int(A4_LANDSCAPE_IN[0] * dpi)
         self._preview_item_height = int(A4_LANDSCAPE_IN[1] * dpi)
         self._preview_rendered = [False] * total
-        for _ in self.preview_spreads:
-            preview = PreviewWidget(self._preview_item_width, self._preview_item_height)
+        for idx, _ in enumerate(self.preview_spreads):
+            preview = PreviewWidget(
+                self._preview_item_width,
+                self._preview_item_height,
+                index=idx,
+                lens_zoom=2.0,
+            )
+            preview.lens_requested.connect(self.on_lens_requested)
             self.preview_layout.addWidget(preview, alignment=Qt.AlignmentFlag.AlignHCenter)
             self.preview_labels.append(preview)
         self._scroll_to_index(current_index)
@@ -605,8 +635,27 @@ class MainWindow(QMainWindow):
             except UserFacingError as e:
                 self._append_log(f"[ERROR] {e}")
                 widget = self.preview_labels[idx]
-                widget.set_message("??????", color="#ffb4a2")
+                widget.set_message("繧ｨ繝ｩ繝ｼ", color="#ffb4a2")
             self._preview_rendered[idx] = True
+
+    def on_lens_requested(self, index: int):
+        if not (0 <= index < len(self.preview_spreads)):
+            return
+        widget = self.preview_labels[index]
+        if widget.has_lens_pixmap() or not widget.has_pixmap():
+            return
+        lens_dpi = max(30, int(self._preview_dpi * widget.lens_zoom()))
+        try:
+            pil = render_spread_preview(
+                self.items,
+                self.preview_spreads[index],
+                dpi=lens_dpi,
+                grayscale=self.cb_gray.isChecked(),
+            )
+            pix = pil_to_qpixmap(pil)
+            widget.set_lens_pixmap(pix)
+        except UserFacingError as e:
+            self._append_log(f"[ERROR] {e}")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
