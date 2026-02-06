@@ -102,15 +102,15 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(left)
 
-        # Right pane
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
+        # Center pane
+        center = QWidget()
+        center_layout = QVBoxLayout(center)
 
         self.preview_label = QLabel("プレビュー")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumSize(520, 360)
         self.preview_label.setStyleSheet("background: #111; color: #ddd;")
-        right_layout.addWidget(self.preview_label, stretch=1)
+        center_layout.addWidget(self.preview_label, stretch=1)
 
         nav = QHBoxLayout()
         self.slider = QSlider(Qt.Orientation.Horizontal)
@@ -120,16 +120,24 @@ class MainWindow(QMainWindow):
         self.lbl_spread = QLabel("見開き 0 / 0")
         nav.addWidget(self.slider, stretch=1)
         nav.addWidget(self.lbl_spread)
-        right_layout.addLayout(nav)
+        center_layout.addLayout(nav)
 
+        splitter.addWidget(center)
+
+        # Right pane
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
         splitter.addWidget(right)
+
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([300, 600, 300])
 
         # Bottom controls
         bottom = QWidget()
         bottom_layout = QVBoxLayout(bottom)
-        layout.addWidget(bottom)
+        right_layout.addWidget(bottom)
 
         mode_row = QHBoxLayout()
         self.rb_booklet = QRadioButton("ブックレット（デフォルト）")
