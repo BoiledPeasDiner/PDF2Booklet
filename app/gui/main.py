@@ -2,11 +2,11 @@ from __future__ import annotations
 import os
 from typing import List
 
-from PySide6.QtCore import Qt, QSettings, QThread
-from PySide6.QtGui import QPixmap, QImage, QIcon
+from PySide6.QtCore import Qt, QSettings, QThread, QPointF, QRectF
+from PySide6.QtGui import QPixmap, QImage, QIcon, QPainter, QColor, QPen, QPainterPath
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
-    QFileDialog, QLabel, QPlainTextEdit, QMessageBox, QScrollArea, QComboBox,
+    QFileDialog, QLabel, QPlainTextEdit, QMessageBox, QScrollArea,
     QRadioButton, QButtonGroup, QCheckBox, QProgressBar, QSplitter,
     QAbstractItemView, QSizePolicy
 )
@@ -34,6 +34,115 @@ def pil_to_qpixmap(pil_img) -> QPixmap:
     qimg = QImage(data, w, h, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(qimg)
 
+class PreviewWidget(QWidget):
+    def __init__(self, width: int, height: int):
+        super().__init__()
+        self.setFixedSize(width, height)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._pixmap: QPixmap | None = None
+        self._message = "隱ｭ縺ｿ霎ｼ縺ｿ荳ｭ窶ｦ"
+        self._message_color = QColor("#777")
+        self._bg_color = QColor("#1a1a1a")
+        self._lens_enabled = False
+        self._lens_center = QPointF(width / 2, height / 2)
+        self._lens_radius = 120.0
+        self._lens_zoom = 2.0
+        self._dragging = False
+
+    def set_pixmap(self, pixmap: QPixmap):
+        self._pixmap = pixmap
+        self._message = ""
+        self.update()
+
+    def set_message(self, msg: str, color: str = "#777"):
+        self._pixmap = None
+        self._message = msg
+        self._message_color = QColor(color)
+        self._lens_enabled = False
+        self._dragging = False
+        self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._pixmap:
+            self._lens_enabled = not self._lens_enabled
+            if self._lens_enabled:
+                self._lens_center = QPointF(event.position())
+            else:
+                self._dragging = False
+            self.update()
+        super().mouseDoubleClickEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._lens_enabled:
+            self._dragging = True
+            self._lens_center = QPointF(event.position())
+            self.update()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._lens_enabled and self._dragging:
+            self._lens_center = QPointF(event.position())
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            if self._lens_enabled:
+                self.update()
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self._bg_color)
+        if self._pixmap:
+            painter.drawPixmap(self.rect(), self._pixmap)
+        else:
+            painter.setPen(self._message_color)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._message)
+            return
+
+        if self._lens_enabled and self._dragging:
+            self._paint_lens(painter)
+
+    def _paint_lens(self, painter: QPainter):
+        if not self._pixmap:
+            return
+        center = self._lens_center
+        radius = self._lens_radius
+        lens_rect = QRectF(center.x() - radius, center.y() - radius, radius * 2, radius * 2)
+        if not lens_rect.intersects(QRectF(self.rect())):
+            return
+
+        src_radius = radius / self._lens_zoom
+        src_rect = QRectF(center.x() - src_radius, center.y() - src_radius, src_radius * 2, src_radius * 2)
+
+        scale_x = self._pixmap.width() / max(1, self.width())
+        scale_y = self._pixmap.height() / max(1, self.height())
+        src_rect = QRectF(
+            src_rect.x() * scale_x,
+            src_rect.y() * scale_y,
+            src_rect.width() * scale_x,
+            src_rect.height() * scale_y,
+        )
+        src_rect = src_rect.intersected(QRectF(0, 0, self._pixmap.width(), self._pixmap.height()))
+
+        painter.save()
+        clip_path = QPainterPath()
+        clip_path.addEllipse(lens_rect)
+        painter.setClipPath(clip_path)
+        painter.drawPixmap(lens_rect, self._pixmap, src_rect)
+        painter.restore()
+
+        shadow_pen = QPen(QColor(0, 0, 0, 140), 4)
+        painter.setPen(shadow_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(lens_rect)
+
+        border_pen = QPen(QColor(255, 255, 255, 220), 2)
+        painter.setPen(border_pen)
+        painter.drawEllipse(lens_rect)
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -47,14 +156,12 @@ class MainWindow(QMainWindow):
         self.settings = QSettings(ORG_NAME, APP_NAME)
         self.items: List[Item] = []
         self.preview_spreads = []
-        self.preview_labels: List[QLabel] = []
+        self.preview_labels: List[PreviewWidget] = []
         self._preview_item_height = 0
         self._preview_item_width = 0
         self._preview_dpi = 110
         self._preview_rendered: List[bool] = []
         self._suspend_scroll_handler = False
-        self.zoom_levels = [50, 75, 100, 125, 150, 200]
-        self.zoom_percent = 100
         self.last_output_pdf = ""
 
         self._thread: QThread | None = None
@@ -150,21 +257,6 @@ class MainWindow(QMainWindow):
         bottom_layout = QVBoxLayout(bottom)
         right_layout.addWidget(bottom)
 
-        zoom_row = QHBoxLayout()
-        zoom_label = QLabel("Zoom")
-        self.btn_zoom_out = QPushButton("-")
-        self.btn_zoom_in = QPushButton("+")
-        self.cmb_zoom = QComboBox()
-        for z in self.zoom_levels:
-            self.cmb_zoom.addItem(f"{z}%")
-        self.cmb_zoom.setCurrentText("100%")
-        zoom_row.addWidget(zoom_label)
-        zoom_row.addWidget(self.btn_zoom_out)
-        zoom_row.addWidget(self.cmb_zoom)
-        zoom_row.addWidget(self.btn_zoom_in)
-        zoom_row.addStretch(1)
-        bottom_layout.addLayout(zoom_row)
-
         mode_row = QHBoxLayout()
         self.rb_booklet = QRadioButton("ブックレット（デフォルト）")
         self.rb_two = QRadioButton("2-in-1（通常順）")
@@ -223,9 +315,6 @@ class MainWindow(QMainWindow):
         self.btn_sort.clicked.connect(self.on_sort_clicked)
         self.btn_blank.clicked.connect(self.on_insert_blank)
         self.preview_scroll.verticalScrollBar().valueChanged.connect(self.on_preview_scrolled)
-        self.cmb_zoom.currentTextChanged.connect(self.on_zoom_changed)
-        self.btn_zoom_out.clicked.connect(lambda: self.on_zoom_step(-1))
-        self.btn_zoom_in.clicked.connect(lambda: self.on_zoom_step(+1))
         self.cb_cover.stateChanged.connect(lambda _: self._rebuild_preview())
         self.cb_gray.stateChanged.connect(lambda _: self._rebuild_preview())
         self.rb_booklet.toggled.connect(self.on_mode_changed)
@@ -425,8 +514,7 @@ class MainWindow(QMainWindow):
 
     def _calc_preview_dpi(self) -> int:
         base_width = self._preview_target_width()
-        scaled_width = max(50, int(base_width * self.zoom_percent / 100))
-        dpi = int(scaled_width / A4_LANDSCAPE_IN[0])
+        dpi = int(base_width / A4_LANDSCAPE_IN[0])
         return max(30, dpi)
 
     def _current_spread_index(self) -> int:
@@ -479,13 +567,9 @@ class MainWindow(QMainWindow):
         self._preview_item_height = int(A4_LANDSCAPE_IN[1] * dpi)
         self._preview_rendered = [False] * total
         for _ in self.preview_spreads:
-            lbl = QLabel("読み込み中…")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color: #777; background: #1a1a1a;")
-            lbl.setFixedSize(self._preview_item_width, self._preview_item_height)
-            lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            self.preview_layout.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignHCenter)
-            self.preview_labels.append(lbl)
+            preview = PreviewWidget(self._preview_item_width, self._preview_item_height)
+            self.preview_layout.addWidget(preview, alignment=Qt.AlignmentFlag.AlignHCenter)
+            self.preview_labels.append(preview)
         self._scroll_to_index(current_index)
         self._update_spread_label()
         self._suspend_scroll_handler = False
@@ -516,39 +600,13 @@ class MainWindow(QMainWindow):
                     grayscale=self.cb_gray.isChecked(),
                 )
                 pix = pil_to_qpixmap(pil)
-                lbl = self.preview_labels[idx]
-                lbl.setPixmap(pix)
-                lbl.setText("")
+                widget = self.preview_labels[idx]
+                widget.set_pixmap(pix)
             except UserFacingError as e:
                 self._append_log(f"[ERROR] {e}")
-                lbl = self.preview_labels[idx]
-                lbl.setText("エラー")
-                lbl.setStyleSheet("color: #ffb4a2; background: #1a1a1a;")
+                widget = self.preview_labels[idx]
+                widget.set_message("??????", color="#ffb4a2")
             self._preview_rendered[idx] = True
-
-    def on_zoom_changed(self, text: str):
-        try:
-            percent = int(text.strip().replace("%", ""))
-        except ValueError:
-            return
-        self._set_zoom(percent)
-
-    def on_zoom_step(self, delta: int):
-        if self.zoom_percent not in self.zoom_levels:
-            self.zoom_levels.append(self.zoom_percent)
-            self.zoom_levels.sort()
-        idx = self.zoom_levels.index(self.zoom_percent)
-        new_idx = max(0, min(len(self.zoom_levels) - 1, idx + delta))
-        self._set_zoom(self.zoom_levels[new_idx])
-
-    def _set_zoom(self, percent: int):
-        if percent <= 0:
-            return
-        self.zoom_percent = percent
-        self.cmb_zoom.blockSignals(True)
-        self.cmb_zoom.setCurrentText(f"{percent}%")
-        self.cmb_zoom.blockSignals(False)
-        self._build_preview_placeholders(keep_position=True)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
