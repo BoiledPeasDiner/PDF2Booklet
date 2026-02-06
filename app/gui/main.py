@@ -80,6 +80,8 @@ class MainWindow(QMainWindow):
         self.listw = DropListWidget()
         self.listw.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.listw.files_dropped.connect(self.on_files_dropped)
+        self.listw.items_reordered.connect(self.on_list_reordered)
+        self.listw.delete_requested.connect(self.on_delete_clicked)
         left_layout.addWidget(self.listw, stretch=1)
 
         btn_row1 = QHBoxLayout()
@@ -250,6 +252,29 @@ class MainWindow(QMainWindow):
         for it in self.items:
             self.listw.addItem("(空白)" if it.kind == "blank" else it.display_name)
 
+        self._attach_item_data()
+
+    def _attach_item_data(self):
+        for i in range(self.listw.count()):
+            widget_item = self.listw.item(i)
+            if i < len(self.items):
+                widget_item.setData(Qt.ItemDataRole.UserRole, self.items[i])
+
+    def _sync_items_from_list(self):
+        new_items: List[Item] = []
+        for i in range(self.listw.count()):
+            widget_item = self.listw.item(i)
+            data = widget_item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, Item):
+                new_items.append(data)
+            elif i < len(self.items):
+                new_items.append(self.items[i])
+        self.items = new_items
+
+    def on_list_reordered(self):
+        self._sync_items_from_list()
+        self._rebuild_preview()
+
     def _append_log(self, msg: str):
         self.log.appendPlainText(msg)
 
@@ -308,6 +333,18 @@ class MainWindow(QMainWindow):
 
     def on_delete_clicked(self):
         rows = sorted({i.row() for i in self.listw.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        if len(rows) > 1:
+            resp = QMessageBox.question(
+                self,
+                "Delete",
+                f"Delete {len(rows)} items?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
         for r in rows:
             if 0 <= r < len(self.items):
                 self.items.pop(r)
