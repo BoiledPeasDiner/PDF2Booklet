@@ -67,12 +67,22 @@ def build_logical_pages(items: list[Item]) -> list[PageRef]:
                 pass
     return pages
 
-def _insert_pil_image(page_out: fitz.Page, pil_img: Image.Image, rect: fitz.Rect, *, compress: bool, jpeg_quality: int) -> None:
+def _prepare_image_for_jpeg(pil_img: Image.Image) -> Image.Image:
+    if pil_img.mode == "RGB":
+        return pil_img
+    # PNGなどの透過を持つ画像は白背景で合成してJPEG化
+    if pil_img.mode == "P":
+        pil_img = pil_img.convert("RGBA")
+    if pil_img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", pil_img.size, (255, 255, 255))
+        bg.paste(pil_img, mask=pil_img.split()[-1])
+        return bg
+    return pil_img.convert("RGB")
+
+def _insert_pil_image(page_out: fitz.Page, pil_img: Image.Image, rect: fitz.Rect, *, jpeg_quality: int) -> None:
     buf = io.BytesIO()
-    if compress:
-        pil_img.save(buf, format="JPEG", quality=jpeg_quality)
-    else:
-        pil_img.save(buf, format="PNG", optimize=False)
+    img = _prepare_image_for_jpeg(pil_img)
+    img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
     page_out.insert_image(rect, stream=buf.getvalue())
 
 def _fit_rect_pts(img_w: int, img_h: int, box_w: float, box_h: float):
@@ -126,12 +136,12 @@ def generate_pdf(
 
             left_img = render_page_to_pil(items, sp.left, dpi=dpi, grayscale=options.grayscale, pdf_cache=pdf_cache)
             lx, ly, lw, lh = _fit_rect_pts(left_img.width, left_img.height, half_w, H)
-            _insert_pil_image(page_out, left_img, fitz.Rect(lx, ly, lx+lw, ly+lh), compress=options.compress, jpeg_quality=jpegq)
+            _insert_pil_image(page_out, left_img, fitz.Rect(lx, ly, lx+lw, ly+lh), jpeg_quality=jpegq)
 
             right_img = render_page_to_pil(items, sp.right, dpi=dpi, grayscale=options.grayscale, pdf_cache=pdf_cache)
             rx0 = half_w
             rx, ry, rw, rh = _fit_rect_pts(right_img.width, right_img.height, half_w, H)
-            _insert_pil_image(page_out, right_img, fitz.Rect(rx0+rx, ry, rx0+rx+rw, ry+rh), compress=options.compress, jpeg_quality=jpegq)
+            _insert_pil_image(page_out, right_img, fitz.Rect(rx0+rx, ry, rx0+rx+rw, ry+rh), jpeg_quality=jpegq)
 
             if progress_cb:
                 progress_cb(i, total)
