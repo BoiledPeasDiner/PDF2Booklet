@@ -16,8 +16,12 @@ from app.core.errors import UserFacingError, is_heic, is_supported_image, is_pdf
 from app.core.engine import build_logical_pages, validate_and_build_items
 from app.core.plan import make_preview_spreads
 from app.core.render import render_spread_preview
-from .widgets import DropListWidget
-from .worker import Worker, Job
+
+# 解決：相対importを絶対importに変更
+# from .widgets import DropListWidget
+# from .worker import Worker, Job
+from app.gui.widgets import DropListWidget
+from app.gui.worker import Worker, Job
 
 APP_TITLE = "PDF2Booklet"
 ORG_NAME = "PDF2Booklet"
