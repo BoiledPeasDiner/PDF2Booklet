@@ -6,16 +6,16 @@ from PySide6.QtCore import Qt, QSettings, QThread
 from PySide6.QtGui import QPixmap, QImage, QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
-    QFileDialog, QLabel, QSlider, QPlainTextEdit, QMessageBox,
+    QFileDialog, QLabel, QPlainTextEdit, QMessageBox, QScrollArea, QComboBox,
     QRadioButton, QButtonGroup, QCheckBox, QProgressBar, QSplitter,
-    QAbstractItemView
+    QAbstractItemView, QSizePolicy
 )
 
 from app.core.types import Item, Options
 from app.core.errors import UserFacingError, is_heic, is_supported_image, is_pdf
 from app.core.engine import build_logical_pages, validate_and_build_items
 from app.core.plan import make_preview_spreads
-from app.core.render import render_spread_preview
+from app.core.render import render_spread_preview, A4_LANDSCAPE_IN
 
 # 解決：相対importを絶対importに変更
 # from .widgets import DropListWidget
@@ -47,6 +47,14 @@ class MainWindow(QMainWindow):
         self.settings = QSettings(ORG_NAME, APP_NAME)
         self.items: List[Item] = []
         self.preview_spreads = []
+        self.preview_labels: List[QLabel] = []
+        self._preview_item_height = 0
+        self._preview_item_width = 0
+        self._preview_dpi = 110
+        self._preview_rendered: List[bool] = []
+        self._suspend_scroll_handler = False
+        self.zoom_levels = [50, 75, 100, 125, 150, 200]
+        self.zoom_percent = 100
         self.last_output_pdf = ""
 
         self._thread: QThread | None = None
@@ -106,19 +114,20 @@ class MainWindow(QMainWindow):
         center = QWidget()
         center_layout = QVBoxLayout(center)
 
-        self.preview_label = QLabel("プレビュー")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(520, 360)
-        self.preview_label.setStyleSheet("background: #111; color: #ddd;")
-        center_layout.addWidget(self.preview_label, stretch=1)
+        self.preview_scroll = QScrollArea()
+        self.preview_scroll.setWidgetResizable(True)
+        self.preview_container = QWidget()
+        self.preview_container.setStyleSheet("background: #111;")
+        self.preview_layout = QVBoxLayout(self.preview_container)
+        self.preview_layout.setContentsMargins(16, 16, 16, 16)
+        self.preview_layout.setSpacing(16)
+        self.preview_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.preview_scroll.setWidget(self.preview_container)
+        center_layout.addWidget(self.preview_scroll, stretch=1)
 
         nav = QHBoxLayout()
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setMinimum(0)
-        self.slider.setMaximum(0)
-        self.slider.setValue(0)
         self.lbl_spread = QLabel("見開き 0 / 0")
-        nav.addWidget(self.slider, stretch=1)
+        nav.addStretch(1)
         nav.addWidget(self.lbl_spread)
         center_layout.addLayout(nav)
 
@@ -138,6 +147,21 @@ class MainWindow(QMainWindow):
         bottom = QWidget()
         bottom_layout = QVBoxLayout(bottom)
         right_layout.addWidget(bottom)
+
+        zoom_row = QHBoxLayout()
+        zoom_label = QLabel("Zoom")
+        self.btn_zoom_out = QPushButton("-")
+        self.btn_zoom_in = QPushButton("+")
+        self.cmb_zoom = QComboBox()
+        for z in self.zoom_levels:
+            self.cmb_zoom.addItem(f"{z}%")
+        self.cmb_zoom.setCurrentText("100%")
+        zoom_row.addWidget(zoom_label)
+        zoom_row.addWidget(self.btn_zoom_out)
+        zoom_row.addWidget(self.cmb_zoom)
+        zoom_row.addWidget(self.btn_zoom_in)
+        zoom_row.addStretch(1)
+        bottom_layout.addLayout(zoom_row)
 
         mode_row = QHBoxLayout()
         self.rb_booklet = QRadioButton("ブックレット（デフォルト）")
@@ -196,7 +220,10 @@ class MainWindow(QMainWindow):
         self.btn_down.clicked.connect(lambda: self.on_move(+1))
         self.btn_sort.clicked.connect(self.on_sort_clicked)
         self.btn_blank.clicked.connect(self.on_insert_blank)
-        self.slider.valueChanged.connect(self.on_slider_changed)
+        self.preview_scroll.verticalScrollBar().valueChanged.connect(self.on_preview_scrolled)
+        self.cmb_zoom.currentTextChanged.connect(self.on_zoom_changed)
+        self.btn_zoom_out.clicked.connect(lambda: self.on_zoom_step(-1))
+        self.btn_zoom_in.clicked.connect(lambda: self.on_zoom_step(+1))
         self.cb_cover.stateChanged.connect(lambda _: self._rebuild_preview())
         self.cb_gray.stateChanged.connect(lambda _: self._rebuild_preview())
         self.rb_booklet.toggled.connect(self.on_mode_changed)
@@ -325,54 +352,171 @@ class MainWindow(QMainWindow):
             pages = build_logical_pages(self.items)
             self.preview_spreads = make_preview_spreads(pages, self.cb_cover.isChecked())
         except UserFacingError as e:
-            self.preview_label.setText("プレビュー生成エラー")
             self._append_log(f"[ERROR] {e}")
-            self.slider.setMaximum(0)
-            self.lbl_spread.setText("見開き 0 / 0")
+            self._set_preview_message("プレビュー生成エラー")
             return
+        self._build_preview_placeholders(keep_position=False)
 
+    def _clear_preview_layout(self):
+        while self.preview_layout.count():
+            item = self.preview_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self.preview_labels = []
+        self._preview_item_height = 0
+        self._preview_item_width = 0
+        self._preview_rendered = []
+
+    def _set_preview_message(self, msg: str):
+        self._clear_preview_layout()
+        label = QLabel(msg)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("color: #ddd;")
+        self.preview_layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.lbl_spread.setText("見開き 0 / 0")
+
+    def _preview_target_width(self) -> int:
+        viewport = self.preview_scroll.viewport()
+        width = viewport.width()
+        if width <= 10:
+            width = self.preview_scroll.width()
+        if width <= 10:
+            width = 520
+        left, top, right, bottom = self.preview_layout.getContentsMargins()
+        return max(200, width - left - right)
+
+    def _calc_preview_dpi(self) -> int:
+        base_width = self._preview_target_width()
+        scaled_width = max(50, int(base_width * self.zoom_percent / 100))
+        dpi = int(scaled_width / A4_LANDSCAPE_IN[0])
+        return max(30, dpi)
+
+    def _current_spread_index(self) -> int:
         total = len(self.preview_spreads)
-        if total == 0:
-            self.slider.setMaximum(0)
-            self.slider.setValue(0)
-            self.lbl_spread.setText("見開き 0 / 0")
-            self.preview_label.setText("プレビューなし")
-            return
+        if total == 0 or self._preview_item_height <= 0:
+            return 0
+        vsb = self.preview_scroll.verticalScrollBar()
+        top_margin = self.preview_layout.contentsMargins().top()
+        spacing = self.preview_layout.spacing()
+        step = max(1, self._preview_item_height + spacing)
+        pos = max(0, vsb.value() - top_margin)
+        return min(total - 1, pos // step)
 
-        cur = min(self.slider.value(), total - 1)
-        self.slider.blockSignals(True)
-        self.slider.setMinimum(0)
-        self.slider.setMaximum(total - 1)
-        self.slider.setValue(cur)
-        self.slider.blockSignals(False)
-        self._render_preview(cur)
-
-    def on_slider_changed(self, v: int):
-        self._render_preview(v)
-
-    def _render_preview(self, index: int):
+    def _scroll_to_index(self, index: int):
         total = len(self.preview_spreads)
-        if total == 0:
-            self.preview_label.setText("プレビューなし")
-            self.lbl_spread.setText("見開き 0 / 0")
+        if total == 0 or self._preview_item_height <= 0:
             return
         index = max(0, min(index, total - 1))
+        top_margin = self.preview_layout.contentsMargins().top()
+        spacing = self.preview_layout.spacing()
+        step = max(1, self._preview_item_height + spacing)
+        self.preview_scroll.verticalScrollBar().setValue(int(top_margin + index * step))
+
+    def _update_spread_label(self):
+        total = len(self.preview_spreads)
+        if total == 0:
+            self.lbl_spread.setText("見開き 0 / 0")
+            return
+        index = self._current_spread_index()
         self.lbl_spread.setText(f"見開き {index + 1} / {total}")
+
+    def on_preview_scrolled(self, _value: int):
+        if self._suspend_scroll_handler:
+            return
+        self._update_spread_label()
+        self._render_visible_previews()
+
+    def _build_preview_placeholders(self, keep_position: bool = True):
+        total = len(self.preview_spreads)
+        if total == 0:
+            self._set_preview_message("プレビューなし")
+            return
+
+        current_index = self._current_spread_index() if keep_position else 0
+        self._suspend_scroll_handler = True
+        self._clear_preview_layout()
+        dpi = self._calc_preview_dpi()
+        self._preview_dpi = dpi
+        self._preview_item_width = int(A4_LANDSCAPE_IN[0] * dpi)
+        self._preview_item_height = int(A4_LANDSCAPE_IN[1] * dpi)
+        self._preview_rendered = [False] * total
+        for _ in self.preview_spreads:
+            lbl = QLabel("読み込み中…")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("color: #777; background: #1a1a1a;")
+            lbl.setFixedSize(self._preview_item_width, self._preview_item_height)
+            lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            self.preview_layout.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignHCenter)
+            self.preview_labels.append(lbl)
+        self._scroll_to_index(current_index)
+        self._update_spread_label()
+        self._suspend_scroll_handler = False
+        self._render_visible_previews()
+
+    def _render_visible_previews(self):
+        total = len(self.preview_spreads)
+        if total == 0 or self._preview_item_height <= 0:
+            return
+        vsb = self.preview_scroll.verticalScrollBar()
+        top_margin = self.preview_layout.contentsMargins().top()
+        spacing = self.preview_layout.spacing()
+        step = max(1, self._preview_item_height + spacing)
+        viewport_h = self.preview_scroll.viewport().height()
+        top = max(0, vsb.value() - top_margin)
+        bottom = top + viewport_h
+        buffer = 1
+        start = max(0, (top // step) - buffer)
+        end = min(total - 1, (bottom // step) + buffer)
+        for idx in range(start, end + 1):
+            if self._preview_rendered[idx]:
+                continue
+            try:
+                pil = render_spread_preview(
+                    self.items,
+                    self.preview_spreads[idx],
+                    dpi=self._preview_dpi,
+                    grayscale=self.cb_gray.isChecked(),
+                )
+                pix = pil_to_qpixmap(pil)
+                lbl = self.preview_labels[idx]
+                lbl.setPixmap(pix)
+                lbl.setText("")
+            except UserFacingError as e:
+                self._append_log(f"[ERROR] {e}")
+                lbl = self.preview_labels[idx]
+                lbl.setText("エラー")
+                lbl.setStyleSheet("color: #ffb4a2; background: #1a1a1a;")
+            self._preview_rendered[idx] = True
+
+    def on_zoom_changed(self, text: str):
         try:
-            pil = render_spread_preview(self.items, self.preview_spreads[index], dpi=110, grayscale=self.cb_gray.isChecked())
-            pix = pil_to_qpixmap(pil)
-            self.preview_label.setPixmap(pix.scaled(
-                self.preview_label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            ))
-        except UserFacingError as e:
-            self.preview_label.setText("プレビュー生成エラー")
-            self._append_log(f"[ERROR] {e}")
+            percent = int(text.strip().replace("%", ""))
+        except ValueError:
+            return
+        self._set_zoom(percent)
+
+    def on_zoom_step(self, delta: int):
+        if self.zoom_percent not in self.zoom_levels:
+            self.zoom_levels.append(self.zoom_percent)
+            self.zoom_levels.sort()
+        idx = self.zoom_levels.index(self.zoom_percent)
+        new_idx = max(0, min(len(self.zoom_levels) - 1, idx + delta))
+        self._set_zoom(self.zoom_levels[new_idx])
+
+    def _set_zoom(self, percent: int):
+        if percent <= 0:
+            return
+        self.zoom_percent = percent
+        self.cmb_zoom.blockSignals(True)
+        self.cmb_zoom.setCurrentText(f"{percent}%")
+        self.cmb_zoom.blockSignals(False)
+        self._build_preview_placeholders(keep_position=True)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._render_preview(self.slider.value())
+        if self.preview_spreads:
+            self._build_preview_placeholders(keep_position=True)
 
     def on_generate_clicked(self):
         if not self.items:
